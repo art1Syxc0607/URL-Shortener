@@ -2,16 +2,8 @@
 
 namespace WebApi.DTOs;
 
-public record CreateShortUrlDto
-{
-    [Url]
-    [Required]
-    public string OriginalUrl { get; init; }
-
-    [MinLength(3)]
-    [MaxLength(15)]
-    [Required]
-    public string Pseudonym { get; init; }
-
-    public string? Password { get; init; }
-}
+public record CreateShortUrlDto(
+    [Required, Url] string OriginalUrl,
+    [Required, MinLength(3), MaxLength(15)] string Pseudonym,
+    string? Password
+);

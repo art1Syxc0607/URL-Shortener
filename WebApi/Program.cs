@@ -1,55 +1,65 @@
-
-
 using Data;
 using Data.Domain;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.EntityFrameworkCore;
-using System.IO;
+using System.ComponentModel.DataAnnotations;
 using WebApi.DTOs;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
+// 1. Добавляем CORS сервисы
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+    {
+        //  Для разработки разрешаем все (в продакшене ограничьте доменом)
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
+    });
+});
 
+// Добавляем сервисы
 builder.Services.AddControllers();
- 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-builder.Services.Extension(builder.Configuration);
 
+// Регистрируем DbContext через ваш Extension метод
+builder.Services.Extension(builder.Configuration);
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+// Swagger
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-// Инициализация при старте
+// Создаем базу данных при старте (АСИНХРОННО!)
 using (var scope = app.Services.CreateScope())
 {
     var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await dbContext.Database.EnsureCreatedAsync(); // или EnsureCreated()
+    // EnsureCreatedAsync требует await. Обернем в задачу
+    await dbContext.Database.EnsureCreatedAsync();
 }
 
+// ===========================================
+// 1. СОЗДАНИЕ КОРОТКОЙ ССЫЛКИ (POST)
+// ===========================================
 app.MapPost("/create", async (CreateShortUrlDto dto, AppDbContext dbContext, HttpContext context) =>
 {
-    var scheme = context.Request.Scheme;            // https
-    var host = context.Request.Host.Value;          // localhost:5001
-    //var path = context.Request.Path;                // /info
+    // 1. Проверка на существование псевдонима
+    if (await dbContext.Ulrs.AnyAsync(u => u.Pseudonym == dto.Pseudonym))
+    {
+        // Возвращаем 400 (Bad Request), а не выбрасываем исключение
+        return Results.BadRequest(new { Error = "This Pseudonym is already taken" });
+    }
 
-    var baseUrl = $"{scheme}://{host}";
-
-    if (await dbContext.Ulrs.AnyAsync(u => u.Pseudonym == dto.Pseudonym)) throw new
-        Exception("This Pseudonym is already taken");
-
+    // 2. Создаем сущность
     var url = new Url
     {
         OriginalFullUrl = dto.OriginalUrl,
-        NewFullUrl = baseUrl + $"/{dto.Pseudonym}", // fullUrl 
         Pseudonym = dto.Pseudonym,
         Password = dto.Password
     };
@@ -57,50 +67,70 @@ app.MapPost("/create", async (CreateShortUrlDto dto, AppDbContext dbContext, Htt
     await dbContext.Ulrs.AddAsync(url);
     await dbContext.SaveChangesAsync();
 
-    return Results.Ok(url.NewFullUrl);
-}
-);
+    // 3. Формируем полную ссылку для ответа клиенту
+    var scheme = context.Request.Scheme;
+    var host = context.Request.Host.Value;
+    var fullShortUrl = $"{scheme}://{host}/{dto.Pseudonym}";
 
-app.MapGet("/{newPath}", async (string newPath, AppDbContext dbContext, HttpContext context) =>
-{
-    var scheme = context.Request.Scheme;            // https
-    var host = context.Request.Host.Value;          // localhost:5001
-    //var path = context.Request.Path;                // /info
-
-    var baseUrl = $"{scheme}://{host}";
-
-    var url = await dbContext.Ulrs.FirstOrDefaultAsync(u => u.NewFullUrl == baseUrl
-    + $"/{newPath}");
-
-    if (url == null) throw new Exception("The url not found");
-
-    if (url.Password != null) throw new Exception("The url requires a password");
-
-    return Results.Redirect($"{url.OriginalFullUrl}");
-
+    // Возвращаем 200 OK с данными
+    return Results.Ok(new
+    {
+        Message = "Short URL created!",
+        ShortUrl = fullShortUrl,
+        Pseudonym = dto.Pseudonym
+    });
 });
 
-app.MapPost("/password", async (GotoOriginalUrlWithPassword dto, AppDbContext dbContext, HttpContext context) =>
+// ===========================================
+// 2. РЕДИРЕКТ ПО ПСЕВДОНИМУ (GET)
+// ===========================================
+app.MapGet("/{pseudonym}", async (string pseudonym, AppDbContext dbContext) =>
 {
-    var scheme = context.Request.Scheme;            // https
-    var host = context.Request.Host.Value;          // localhost:5001
-    //var path = context.Request.Path;                // /info
+    // Ищем по псевдониму (ПРАВИЛЬНО!)
+    var url = await dbContext.Ulrs.FirstOrDefaultAsync(u => u.Pseudonym == pseudonym);
 
-    var baseUrl = $"{scheme}://{host}";
+    if (url == null)
+    {
+        return Results.NotFound(new { Error = "Short URL not found" });
+    }
 
-    var url = await dbContext.Ulrs.FirstOrDefaultAsync(u => u.NewFullUrl == dto.NewFullUrl);
+    // ЕСЛИ ЕСТЬ ПАРОЛЬ — возвращаем статус 403, чтобы клиент знал, что нужно ввести пароль
+    if (!string.IsNullOrEmpty(url.Password))
+    {
+        return Results.Json(new { RequiresPassword = true, Pseudonym = pseudonym }, statusCode: 403);
+    }
 
-    if (url == null) throw new Exception("The url not found");
-
-    if (url.Password != dto.Password) throw new Exception("Wrong password");
-
-    return Results.Redirect($"{url.OriginalFullUrl}");
+    // Если пароля нет — редиректим
+    return Results.Redirect(url.OriginalFullUrl);
 });
 
+// ===========================================
+// 3. ОБРАБОТКА ПАРОЛЯ (POST)
+// ===========================================
+app.MapPost("/password", async (GotoOriginalUrlWithPassword dto, AppDbContext dbContext) =>
+{
+    var url = await dbContext.Ulrs.FirstOrDefaultAsync(u => u.Pseudonym == dto.Pseudonym);
+
+    if (url == null)
+    {
+        return Results.NotFound(new { Error = "Short URL not found" });
+    }
+
+    // Проверяем пароль
+    if (url.Password != dto.Password)
+    {
+        return Results.BadRequest(new { Error = "Wrong password" });
+    }
+
+    // Если пароль верный — редиректим
+    return Results.Redirect(url.OriginalFullUrl);
+});
+
+// ===========================================
+// 4. Middleware (стандартные)
+// ===========================================
 app.UseHttpsRedirection();
-
 app.UseAuthorization();
-
 app.MapControllers();
 
 app.Run();

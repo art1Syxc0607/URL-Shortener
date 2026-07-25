@@ -1,3 +1,6 @@
 ﻿namespace WebApi.DTOs;
 
-public record GotoOriginalUrlWithPassword(string NewFullUrl, string Password);
+public record GotoOriginalUrlWithPassword(
+    string Pseudonym,
+    string Password
+);
